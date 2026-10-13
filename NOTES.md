@@ -36,15 +36,22 @@ The page being turned is a grid mesh (40x80 cells). Everything is in logical coo
 turn towards -x; RTL only mirrors x on the way to the screen (and the uv u).
 - The fold is a line: it crosses height `pivotY` at `x = X`, leaning by `tilt` (dx per dy, > 0 = the bottom of the
   page is further over). `n` = unit normal towards the free edge, `dd` = signed distance of a point past the fold.
-- `dd <= 0`: flat, unchanged (with a soft darker band just before the fold, 0 again at the fold so it meets the
-  cylinder without a seam).
+- `dd <= 0`: flat, unchanged (shaded with a soft darker band just before the fold, none at the fold itself so it
+  meets the cylinder without a seam).
 - `0 < dd < πR`: wrapped round a cylinder of radius R lying on the page: `p + n(R sin a - dd)`, `a = dd / R`,
   height `R(1 - cos a)`. Shade `0.62 + 0.38|cos a|` (darkest edge-on).
+- Shading is per pixel (`CURL_FS` in game.c): the fragment shader recomputes dd from the texture coordinate (the
+  spot on the flat page, exact everywhere) and applies the band / cylinder shade. Per-vertex colours showed the mesh
+  triangles as faint facets (the shade isn't linear across the bent mesh).
 - `dd >= πR`: past the top of the cylinder, lying flat face down: `p - n(2dd - πR)`.
 - Triangles whose screen winding flipped show the back of the paper. Front-facing parts are always lower
   (z < R) than face-down ones (z > R), so: sort each set by z, draw fronts, then backs. No depth buffer.
-- Shadow on the page underneath: a gradient quad starting just past the cylinder (`L0 + 0.7R n`), fading out over
-  16% of the width, strength fading in and out with the turn.
+- Shadow on the page underneath: a contact shadow from `L0 + 0.85R n` to `L0 + 1.7R n` (just past the roll's outer
+  edge), clipped to the part of the fold line inside the page (where the roll actually is), strength 0.4 scaled by
+  how far the page reaches past the fold (`lift / πR`). Earlier versions drew it along the whole line and 16% of the
+  width out: a shadow with no paper casting it (at the first touch, and after the roll left the page).
+  The user still finds it not quite right (2026-10-13): a real shadow would follow the lifted paper's silhouette
+  (e.g. render the lifted part darkened and offset, or soften the ends of the band).
 - R = 9% of the width, but never below 1.6 mesh cells (see dead ends).
 - The spine: the fold may never cross x = 0 (that would tear the page off the binding). `spinetilt()` clamps the
   lean so both spine corners stay on the flat side; at X <= 0 the fold is vertical. X itself is never clamped by
@@ -90,6 +97,7 @@ turn towards -x; RTL only mirrors x on the way to the screen (and the uv u).
 8. **Ignoring touches during the animation**: every quick second swipe did nothing (the user's "fails 1 in 5").
 
 ## Not done
+- The shadow (see above): better than before, not fully convincing yet.
 - Remember the last page per chapter; continue into the next chapter at the end.
 - Webtoon strips: long pages are scaled to fit one screen (tiny). They'd need splitting into screen-sized slices.
 - Two-page spreads in landscape.

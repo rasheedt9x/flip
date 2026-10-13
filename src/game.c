@@ -59,6 +59,8 @@ typedef struct {
     RenderTexture2D back;          // the back of the page being turned
     int backPage;                  // page + 1
     rlRenderBatch curlBatch;       // big enough for the whole curl mesh (see drawcurl)
+    Shader curlShader;             // per-pixel shading of the curl (see CURL_FS)
+    int locFold, locN, locPage;
 
     // the page turn
     int turn;                      // 0 none, 1 forward (page -> page+1), -1 backward
@@ -337,7 +339,30 @@ static void drawflat(Texture2D *t)
 
 // ---------------------------------------------------------------------------------------------- the curl
 
-typedef struct { Vector2 p; float z, shade; } CurlVert;
+typedef struct { Vector2 p; float z; } CurlVert;
+
+// The curl's shading, per pixel: brightness depends on the distance past the fold (dd), which isn't linear across
+// the bent mesh, so per-vertex colours showed the triangles. dd comes from the texture coordinate (the original
+// spot on the page), which is exact everywhere.
+static const char *CURL_FS =
+    "#version 100\n"
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH\n precision highp float;\n#else\n precision mediump float;\n#endif\n"
+    "varying vec2 fragTexCoord;\n"
+    "varying vec4 fragColor;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec4 colDiffuse;\n"
+    "uniform vec4 fold;\n"  // L0.x, L0.y, R, rtl (0/1)
+    "uniform vec2 n;\n"
+    "uniform vec2 page;\n"  // width, height
+    "void main() {\n"
+    "    float u = fold.w > 0.5 ? 1.0 - fragTexCoord.x : fragTexCoord.x;\n"
+    "    vec2 p = vec2(u, 1.0 - fragTexCoord.y) * page;\n"
+    "    float dd = dot(p - fold.xy, n), R = fold.z, shade = 1.0;\n"
+    "    if (dd <= 0.0) shade = 1.0 - 0.12 * sin(3.14159265 * clamp(-dd / (1.5 * R), 0.0, 1.0));\n"  // soft band before the fold
+    "    else if (dd < 3.14159265 * R) shade = 0.62 + 0.38 * abs(cos(dd / R));\n"  // darkest where edge-on
+    "    vec4 t = texture2D(texture0, fragTexCoord);\n"
+    "    gl_FragColor = vec4(t.rgb * shade, t.a) * colDiffuse * fragColor;\n"
+    "}\n";
 typedef struct { int a, b, c; float z; } Tri;
 
 static int trizcmp(const void *x, const void *y)
@@ -382,9 +407,8 @@ static void drawtris(Game *g, Texture2D *t, CurlVert *v, Tri *tris, int n)
             for (int k = 0; k < 4; k++) {
                 int j = idx[k];
                 float u = (float)(j % (GX + 1)) / GX, vv = (float)(j / (GX + 1)) / GY;
-                unsigned char s = (unsigned char)(255 * v[j].shade);
                 Vector2 sp = toscreen(g, v[j].p);
-                rlColor4ub(s, s, s, 255);
+                rlColor4ub(255, 255, 255, 255);
                 rlTexCoord2f(g->rtl ? 1 - u : u, 1 - vv);  // render textures are stored upside down
                 rlVertex3f(sp.x, sp.y, -0.5f);  // mid depth range (rlVertex2f can sit exactly on the far plane)
             }
@@ -416,22 +440,35 @@ static void drawcurl(Game *g, int page)
     rlSetRenderBatchActive(&g->curlBatch);
     rlDisableBackfaceCulling();
 
-    // the shadow the curl throws on the page underneath
+    // The shadow the lifted paper throws on the page underneath: a narrow band just past the roll's outer edge
+    // (L0 + R n), only along the part of the fold line that's inside the page (that's where the roll is), and only
+    // as strong as the page is lifted (nothing at the first touch, nothing once the roll has left the page).
     {
         Vector2 t = { -n.y, n.x };
-        float strength = clampf((w - g->X) / (w * 0.3f), 0, 1) * clampf((g->X - turnedX()) / (w * 0.2f), 0, 1) * 0.45f;
-        Vector2 a = Vector2Add(L0, Vector2Scale(n, R * 0.7f)), b = Vector2Add(a, Vector2Scale(n, w * 0.16f));
-        Vector2 q[4] = { Vector2Add(a, Vector2Scale(t, 4 * h)), Vector2Subtract(a, Vector2Scale(t, 4 * h)),
-                         Vector2Subtract(b, Vector2Scale(t, 4 * h)), Vector2Add(b, Vector2Scale(t, 4 * h)) };
-        unsigned char al[4] = { 255 * strength, 255 * strength, 0, 0 };
-        rlBegin(RL_QUADS);
-        int order[4] = { 0, 1, 2, 3 };
+        float t0 = -1e9f, t1 = 1e9f;  // clip L0 + s t to the page (Liang-Barsky)
+        float pd[4] = { -t.x, t.x, -t.y, t.y }, qd[4] = { L0.x, w - L0.x, L0.y, h - L0.y };
         for (int k = 0; k < 4; k++) {
-            Vector2 s = toscreen(g, q[order[k]]);
-            rlColor4ub(0, 0, 0, al[order[k]]);
-            rlVertex3f(s.x, s.y, -0.5f);
+            if (fabsf(pd[k]) < 1e-6f) { if (qd[k] < 0) t0 = 1, t1 = 0; continue; }
+            float r = qd[k] / pd[k];
+            if (pd[k] < 0) t0 = fmaxf(t0, r); else t1 = fminf(t1, r);
         }
-        rlEnd();
+        float lift = 0;  // how far the page reaches past the fold
+        Vector2 corners[4] = { { 0, 0 }, { w, 0 }, { 0, h }, { w, h } };
+        for (int k = 0; k < 4; k++) lift = fmaxf(lift, Vector2DotProduct(Vector2Subtract(corners[k], L0), n));
+        float strength = 0.4f * clampf(lift / (PI * R), 0, 1);
+        if (t1 > t0 && strength > 0.004f) {
+            Vector2 a = Vector2Add(L0, Vector2Scale(n, R * 0.85f)), b = Vector2Add(L0, Vector2Scale(n, R * 1.7f));
+            Vector2 q[4] = { Vector2Add(a, Vector2Scale(t, t0)), Vector2Add(a, Vector2Scale(t, t1)),
+                             Vector2Add(b, Vector2Scale(t, t1)), Vector2Add(b, Vector2Scale(t, t0)) };
+            unsigned char al[4] = { 255 * strength, 255 * strength, 0, 0 };
+            rlBegin(RL_QUADS);
+            for (int k = 0; k < 4; k++) {
+                Vector2 sp = toscreen(g, q[k]);
+                rlColor4ub(0, 0, 0, al[k]);
+                rlVertex3f(sp.x, sp.y, -0.5f);
+            }
+            rlEnd();
+        }
     }
 
     static CurlVert v[(GX + 1) * (GY + 1)];
@@ -442,19 +479,14 @@ static void drawcurl(Game *g, int page)
             float dd = Vector2DotProduct(Vector2Subtract(p, L0), n);
             CurlVert *cv = &v[y * (GX + 1) + x];
             if (dd <= 0) {
-                // the flat paper darkens a little where it starts to lift
-                // (a soft band just before the fold, back to full brightness at the fold to match the cylinder)
-                float k = sinf(PI * clampf(-dd / (1.5f * R), 0, 1));
-                *cv = (CurlVert){ p, 0, 1 - 0.12f * k };
+                *cv = (CurlVert){ p, 0 };
             } else if (dd < PI * R) {
                 float a = dd / R;
                 cv->p = Vector2Add(p, Vector2Scale(n, R * sinf(a) - dd));
                 cv->z = R * (1 - cosf(a));
-                cv->shade = 0.62f + 0.38f * fabsf(cosf(a));  // darkest where the paper is edge-on
             } else {
                 cv->p = Vector2Subtract(p, Vector2Scale(n, dd - PI * R + dd));
                 cv->z = 2 * R;
-                cv->shade = 1;
             }
         }
     int nf = 0, nb = 0;
@@ -473,9 +505,21 @@ static void drawcurl(Game *g, int page)
     // front-facing parts are all lower than the face-down ones (z < R vs z > R), so two sorted passes are enough
     qsort(fronts, nf, sizeof *fronts, trizcmp);
     qsort(backs, nb, sizeof *backs, trizcmp);
+    if (!g->curlShader.id) {
+        g->curlShader = LoadShaderFromMemory(NULL, CURL_FS);
+        g->locFold = GetShaderLocation(g->curlShader, "fold");
+        g->locN = GetShaderLocation(g->curlShader, "n");
+        g->locPage = GetShaderLocation(g->curlShader, "page");
+    }
+    BeginShaderMode(g->curlShader);
+    float fold[4] = { L0.x, L0.y, R, g->rtl ? 1 : 0 }, page2[2] = { w, h };
+    SetShaderValue(g->curlShader, g->locFold, fold, SHADER_UNIFORM_VEC4);
+    SetShaderValue(g->curlShader, g->locN, &n, SHADER_UNIFORM_VEC2);
+    SetShaderValue(g->curlShader, g->locPage, page2, SHADER_UNIFORM_VEC2);
     drawtris(g, front, v, fronts, nf);
     drawtris(g, back, v, backs, nb);
     rlDrawRenderBatchActive();
+    EndShaderMode();
     rlEnableBackfaceCulling();
     rlSetRenderBatchActive(NULL);
 }
@@ -686,6 +730,7 @@ static void unload(void *state)
     for (int i = 0; i < CACHE; i++) if (g->sheet[i].id) UnloadRenderTexture(g->sheet[i]);
     if (g->back.id) UnloadRenderTexture(g->back);
     if (g->curlBatch.vertexBuffer) rlUnloadRenderBatch(g->curlBatch);
+    if (g->curlShader.id) UnloadShader(g->curlShader);
     UnloadFont(g->font);
 }
 
